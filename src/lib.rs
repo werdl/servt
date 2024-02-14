@@ -1,10 +1,10 @@
 pub mod status_code;
 
+use std::time::SystemTime;
+
 use status_code::CodeLookup;
 
-use humantalk::{Config, HowToBugReport};
-
-use async_std::task;
+use smol::{future, Executor};
 use httparse;
 use status_code::STATUS_CODES;
 use std::collections::HashMap;
@@ -30,15 +30,31 @@ pub struct Server {
 
     error_callbacks:
         HashMap<u16, Arc<Mutex<dyn Fn(ParsedRequest) -> (String, u16) + Send + 'static>>>,
+
+    pub should_continue: bool,
+
+    started: u128,
 }
 
 impl Server {
+    fn say(&self, s: &str) {
+        println!(
+            "[{}s] {}",
+            ((SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() - self.started) / 1000) as u128,
+            s
+        );
+    }
     pub fn new(port: u16, host: String) -> Self {
         Server {
             port,
             host,
             route_callbacks: HashMap::new(),
             error_callbacks: HashMap::new(),
+            should_continue: true,
+            started: 0,
         }
     }
 
@@ -54,16 +70,7 @@ impl Server {
     }
 
     fn handle(&mut self, mut stream: TcpStream) {
-        let humantalk_config = Config::custom(
-            Config::default().colors,
-            HowToBugReport::new(
-                "The server has crashed.".to_string(),
-                "https://github.com/werdl/servt".to_string(),
-            ),
-        );
-
-        humantalk_config
-            .info(format!("Incoming connection from {}", stream.peer_addr().unwrap()).as_str());
+        self.say(format!("[INFO] New connection from {}", stream.peer_addr().unwrap()).as_str());
 
         let buf_reader = BufReader::new(&mut stream);
         let request_text = buf_reader
@@ -140,22 +147,21 @@ impl Server {
             response = match callback.clone().try_lock() {
                 Ok(prepared_callback) => prepared_callback(parsed_request.clone()),
                 Err(_) => {
-                    humantalk_config.error(
-                        "Failed to acquire lock on callback (probably because it has panicked), attempting to error out with 500.",
+                    self.say(
+                        "[ERROR] Failed to acquire lock on callback (probably because it has panicked), attempting to error out with 500.",
                     );
                     ("INTERNAL SERVER ERROR".to_string(), 500)
                 }
             };
         } else {
-            humantalk_config.error("No route found, attempting to error out with 404.");
+            self.say("[ERROR] No route found, attempting to error out with 404.");
 
             response = self.find_error_or(parsed_request.clone(), ("NOT FOUND".to_string(), 404));
-
         }
 
-        humantalk_config.info(
+        self.say(
             format!(
-                "Responded with status code {} {} to {}",
+                "[INFO] Responded with status code {} {} to {}",
                 response.1,
                 STATUS_CODES.lookup(response.1).unwrap(),
                 stream.peer_addr().unwrap()
@@ -197,16 +203,25 @@ impl Server {
     }
 
     pub fn run(&mut self) {
+        self.started = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u128;
         let listener = TcpListener::bind(format!("{}:{}", self.host, self.port)).unwrap();
         println!("Server listening on {}:{}", self.host, self.port);
 
         for stream in listener.incoming() {
+            if !self.should_continue {
+                break;
+            }
+
             let stream = stream.unwrap();
 
             let mut self_clone = self.clone();
-            task::spawn(async move {
+            
+            smol::spawn(async move {
                 self_clone.handle(stream);
-            });
+            }).detach();
         }
     }
 }
@@ -215,15 +230,16 @@ impl Server {
 mod tests {
     use super::*;
 
-    #[async_std::test]
-    async fn test_server() {
+    #[test]
+    fn test_server() {
         let mut server = Server::new(8080, "localhost".to_string());
 
         server.route("/", |req| {
-            (format!("Hello, {:?}!", req.args.get("name").unwrap()), 200)
+            (
+                format!("Hello, {}!", req.args.get("name").unwrap_or(&"world".to_string())),
+                200,
+            )
         });
-
-        server.error(404, |req| (format!("No route found for {:?}", req), 404));
 
         server.run();
     }

@@ -4,7 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async-std = { version = "1.12.0", features = ["async-attributes", "attributes"] }
-futures = "0.3.30"
+smol = "2.0.0"
 httparse = "1.8.0"
-humantalk = "0.1.2"
