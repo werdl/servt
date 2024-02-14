@@ -2,7 +2,19 @@
 name = "servt"
 version = "0.1.0"
 edition = "2021"
+categories = ["network-programming", "asynchronous", "web-programming::http-server"]
+license = "MIT"
+repository = "https://github.com/werdl/servt"
+readme = "README.md"
+keywords = ["http", "server", "async", "small", "lightweight"]
+documentation = "https://docs.rs/servt"
+homepage = "https://github.com/werdl/servt"
+
 
 [dependencies]
-smol = "2.0.0"
+smol = {"version" = "2.0.0", optional = true }
 httparse = "1.8.0"
+
+[features]
+default = ["async"]
+async = ["dep:smol"]

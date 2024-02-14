@@ -4,7 +4,9 @@ use std::time::SystemTime;
 
 use status_code::CodeLookup;
 
-use smol::{future, Executor};
+#[cfg(feature = "async")]
+use smol;
+
 use httparse;
 use status_code::STATUS_CODES;
 use std::collections::HashMap;
@@ -43,7 +45,9 @@ impl Server {
             ((SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_millis() - self.started) / 1000) as u128,
+                .as_millis()
+                - self.started)
+                / 1000) as u128,
             s
         );
     }
@@ -70,7 +74,13 @@ impl Server {
     }
 
     fn handle(&mut self, mut stream: TcpStream) {
-        self.say(format!("[INFO] New connection from {}", stream.peer_addr().unwrap()).as_str());
+        self.say(
+            format!(
+                "[INFO]    New connection from {}",
+                stream.peer_addr().unwrap()
+            )
+            .as_str(),
+        );
 
         let buf_reader = BufReader::new(&mut stream);
         let request_text = buf_reader
@@ -148,20 +158,25 @@ impl Server {
                 Ok(prepared_callback) => prepared_callback(parsed_request.clone()),
                 Err(_) => {
                     self.say(
-                        "[ERROR] Failed to acquire lock on callback (probably because it has panicked), attempting to error out with 500.",
+                        "[ERROR]   Failed to acquire lock on callback (probably because it has panicked), attempting to error out with 500.",
                     );
                     ("INTERNAL SERVER ERROR".to_string(), 500)
                 }
             };
         } else {
-            self.say("[ERROR] No route found, attempting to error out with 404.");
+            self.say("[ERROR]   No route found, attempting to error out with 404.");
 
             response = self.find_error_or(parsed_request.clone(), ("NOT FOUND".to_string(), 404));
         }
 
         self.say(
             format!(
-                "[INFO] Responded with status code {} {} to {}",
+                "{} Responded with status code {} {} to {}",
+                if response.1.to_string().chars().nth(0).unwrap() == '2' {
+                    "[SUCCESS]"
+                } else {
+                    "[WARNING]"
+                },
                 response.1,
                 STATUS_CODES.lookup(response.1).unwrap(),
                 stream.peer_addr().unwrap()
@@ -218,10 +233,17 @@ impl Server {
             let stream = stream.unwrap();
 
             let mut self_clone = self.clone();
-            
+
+            #[cfg(feature = "async")]
             smol::spawn(async move {
                 self_clone.handle(stream);
-            }).detach();
+            })
+            .detach();
+
+            #[cfg(not(feature = "async"))]
+            std::thread::spawn(move || {
+                self_clone.handle(stream);
+            });
         }
     }
 }
@@ -236,10 +258,15 @@ mod tests {
 
         server.route("/", |req| {
             (
-                format!("Hello, {}!", req.args.get("name").unwrap_or(&"world".to_string())),
+                format!(
+                    "Hello, {}!",
+                    req.args.get("name").unwrap_or(&"world".to_string())
+                ),
                 200,
             )
         });
+
+        server.error(404, |_| ("Custom 404 page".to_string(), 404));
 
         server.run();
     }
