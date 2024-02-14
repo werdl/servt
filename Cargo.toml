@@ -9,6 +9,7 @@ readme = "README.md"
 keywords = ["http", "server", "async", "small", "lightweight"]
 documentation = "https://docs.rs/servt"
 homepage = "https://github.com/werdl/servt"
+description = "A small, lightweight, and fast optionally asynchronous HTTP server library for Rust."
 
 
 [dependencies]
