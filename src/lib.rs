@@ -1,10 +1,16 @@
+pub mod status_code;
+
+use status_code::CodeLookup;
+
+use humantalk::{Config, HowToBugReport};
+
 use async_std::task;
 use httparse;
+use status_code::STATUS_CODES;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRequest {
@@ -21,6 +27,9 @@ pub struct Server {
 
     route_callbacks:
         HashMap<String, Arc<Mutex<dyn Fn(ParsedRequest) -> (String, u16) + Send + 'static>>>,
+
+    error_callbacks:
+        HashMap<u16, Arc<Mutex<dyn Fn(ParsedRequest) -> (String, u16) + Send + 'static>>>,
 }
 
 impl Server {
@@ -29,24 +38,45 @@ impl Server {
             port,
             host,
             route_callbacks: HashMap::new(),
+            error_callbacks: HashMap::new(),
         }
     }
 
-    fn handle(&self, mut stream: TcpStream) {
+    fn find_error_or(&self, request: ParsedRequest, default: (String, u16)) -> (String, u16) {
+        let callback = &self.error_callbacks.get(&default.1);
+
+        let (msg, code) = match callback {
+            Some(callback) => callback.lock().unwrap()(request),
+            None => default,
+        };
+
+        (msg, code)
+    }
+
+    fn handle(&mut self, mut stream: TcpStream) {
+        let humantalk_config = Config::custom(
+            Config::default().colors,
+            HowToBugReport::new(
+                "The server has crashed.".to_string(),
+                "https://github.com/werdl/servt".to_string(),
+            ),
+        );
+
+        humantalk_config
+            .info(format!("Incoming connection from {}", stream.peer_addr().unwrap()).as_str());
+
         let buf_reader = BufReader::new(&mut stream);
         let request_text = buf_reader
             .lines()
             .map(|result| result.unwrap())
             .take_while(|line| !line.is_empty())
-            .collect::<Vec<_>>().as_slice().join("\r\n");
-
+            .collect::<Vec<_>>()
+            .as_slice()
+            .join("\r\n");
 
         let mut headers = [httparse::EMPTY_HEADER; 16];
         let mut req = httparse::Request::new(&mut headers);
         req.parse(request_text.as_bytes()).unwrap();
-
-        println!("{:?}", request_text);
-
 
         let splitted_temp = request_text.split("\r\n\r\n").collect::<Vec<&str>>();
 
@@ -101,30 +131,49 @@ impl Server {
             form,
         };
 
-        println!("{:?}", parsed_request);
+        let path = req.path.unwrap().split("?").collect::<Vec<&str>>()[0];
 
-        if let Some(callback) = self.route_callbacks.get(req.path.unwrap()) {
+        let response: (String, u16);
+
+        if let Some(callback) = self.route_callbacks.get(path) {
             // call the callback
-            let response = callback.lock().unwrap()(parsed_request);
-
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Length: {}\r\n\r\n{}",
-                response.1,
-                response.0.len(),
-                response.0
-            );
-
-            stream.write_all(response.as_bytes()).unwrap();
+            response = match callback.clone().try_lock() {
+                Ok(prepared_callback) => prepared_callback(parsed_request.clone()),
+                Err(_) => {
+                    humantalk_config.error(
+                        "Failed to acquire lock on callback (probably because it has panicked), attempting to error out with 500.",
+                    );
+                    ("INTERNAL SERVER ERROR".to_string(), 500)
+                }
+            };
         } else {
-            let response = "HTTP/1.1 404 NOT FOUND\r\nContent-Length: 0\r\n\r\n";
-            stream.write_all(response.as_bytes()).unwrap();
+            humantalk_config.error("No route found, attempting to error out with 404.");
+
+            response = self.find_error_or(parsed_request.clone(), ("NOT FOUND".to_string(), 404));
+
         }
 
-        println!("Request handled");
+        humantalk_config.info(
+            format!(
+                "Responded with status code {} {} to {}",
+                response.1,
+                STATUS_CODES.lookup(response.1).unwrap(),
+                stream.peer_addr().unwrap()
+            )
+            .as_str(),
+        );
+
+        let response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n\r\n{}",
+            response.1,
+            STATUS_CODES.lookup(response.1).unwrap(),
+            response.0.len(),
+            response.0
+        );
+
+        stream.write_all(response.as_bytes()).unwrap();
 
         stream.flush().unwrap();
-
-        println!("Request handled");
 
         stream.shutdown(Shutdown::Both).unwrap();
 
@@ -139,14 +188,22 @@ impl Server {
             .insert(path.to_string(), Arc::new(Mutex::new(callback)));
     }
 
-    pub fn run(&self) {
+    pub fn error<F>(&mut self, code: u16, callback: F)
+    where
+        F: Fn(ParsedRequest) -> (String, u16) + Send + 'static,
+    {
+        self.error_callbacks
+            .insert(code, Arc::new(Mutex::new(callback)));
+    }
+
+    pub fn run(&mut self) {
         let listener = TcpListener::bind(format!("{}:{}", self.host, self.port)).unwrap();
         println!("Server listening on {}:{}", self.host, self.port);
 
         for stream in listener.incoming() {
             let stream = stream.unwrap();
 
-            let self_clone = self.clone();
+            let mut self_clone = self.clone();
             task::spawn(async move {
                 self_clone.handle(stream);
             });
@@ -157,26 +214,17 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
 
-    #[test]
-    fn test_server() {
-        thread::spawn(move || {
-            let mut server = Server::new(8080, "localhost".to_string());
+    #[async_std::test]
+    async fn test_server() {
+        let mut server = Server::new(8080, "localhost".to_string());
 
-            server.route("/", |req| {
-                (
-                    format!(
-                        "Hello, you made a {} request with args {:?} and form {:?}",
-                        req.method, req.args, req.form
-                    ),
-                    200,
-                )
-            });
+        server.route("/", |req| {
+            (format!("Hello, {:?}!", req.args.get("name").unwrap()), 200)
+        });
 
-            server.run();
-        })
-        .join()
-        .unwrap();
+        server.error(404, |req| (format!("No route found for {:?}", req), 404));
+
+        server.run();
     }
 }
