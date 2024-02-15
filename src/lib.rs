@@ -10,7 +10,7 @@ use smol;
 use httparse;
 use status_code::STATUS_CODES;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +32,8 @@ pub struct Server {
 
     error_callbacks:
         HashMap<u16, Arc<Mutex<dyn Fn(ParsedRequest) -> (String, u16) + Send + 'static>>>,
+
+    redirects: HashMap<String, String>,
 
     pub should_continue: bool,
 
@@ -59,6 +61,7 @@ impl Server {
             error_callbacks: HashMap::new(),
             should_continue: true,
             started: 0,
+            redirects: HashMap::new(),
         }
     }
 
@@ -84,45 +87,11 @@ impl Server {
     }
 
     fn error_with_code(&self, code: u16, request: ParsedRequest) -> (String, u16) {
-        self.find_error_or(request, (STATUS_CODES.lookup(code).unwrap().to_string(), code))
+        self.find_error_or(
+            request,
+            (STATUS_CODES.lookup(code).unwrap().to_string(), code),
+        )
     }
-
-    fn get_body(&self, stream: &mut TcpStream) -> String {
-        let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
-
-        let mut request_text = String::new();
-        let mut headers = [httparse::EMPTY_HEADER; 16];
-        let mut req = httparse::Request::new(&mut headers);
-
-        loop {
-            let mut line = String::new();
-            buf_reader.read_line(&mut line).unwrap();
-            request_text.push_str(&line);
-
-            if line == "\r\n" {
-                break;
-            }
-        }
-
-        req.parse(request_text.as_bytes()).unwrap();
-
-        println!("{:?}", req.headers);
-
-        if self.search_for_headers(&req.headers, "Expect").unwrap_or_default() == "100-continue" {
-            self.say("[INFO]    Responding with 100 CONTINUE");
-            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
-
-            request_text.clear();
-
-            println!("Reading to string");
-            buf_reader.read_to_string(&mut request_text).unwrap();
-
-            println!("done{:?}", request_text);
-        }
-
-        (request_text)
-    }
-
 
     fn handle(&mut self, mut stream: TcpStream) {
         let mut code = 200;
@@ -135,11 +104,70 @@ impl Server {
             .as_str(),
         );
 
-        let request_text = self.get_body(&mut stream);
+        let mut reader = BufReader::new(&stream);
+
+        let mut request_text = String::new();
+
+        loop {
+            let mut buffer = [0; 1024];
+            let bytes_read = reader.read(&mut buffer).unwrap();
+
+            request_text.push_str(&String::from_utf8_lossy(&buffer[..bytes_read]));
+
+            if bytes_read < 1024 {
+                break;
+            }
+        }
 
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
-        req.parse(request_text.as_bytes()).unwrap();
+
+        if !req.headers.is_empty() {
+            req.parse(request_text.as_bytes()).unwrap();
+        }
+
+        let body: String;
+
+        // check for 100-continue header
+        if self
+            .search_for_headers(&req.headers, "Expect")
+            .unwrap_or_default()
+            == "100-continue"
+        {
+            self.say("[INFO]    Expect: 100-continue header found, sending 100 continue response");
+
+            stream
+                .write_all("HTTP/1.1 100 Continue\r\n\r\n".as_bytes())
+                .unwrap();
+
+            stream.flush().unwrap();
+
+            // read the rest of the request to get the body
+            let mut reader = BufReader::new(&stream);
+
+            let mut body_text = String::new();
+
+            loop {
+                let mut buffer = [0; 1024];
+                let bytes_read = reader.read(&mut buffer).unwrap();
+
+                body_text.push_str(&String::from_utf8_lossy(&buffer[..bytes_read]));
+
+                if bytes_read < 1024 {
+                    break;
+                }
+            }
+
+            body = body_text;
+        } else {
+            let splitted_temp = request_text.split("\r\n\r\n").collect::<Vec<&str>>();
+
+            body = if splitted_temp.len() > 1 {
+                splitted_temp[1].to_string()
+            } else {
+                "".to_string()
+            };
+        }
 
         let required_headers = ["Host"];
 
@@ -155,15 +183,6 @@ impl Server {
                 code = 400;
             }
         }
-
-            
-        let splitted_temp = request_text.split("\r\n\r\n").collect::<Vec<&str>>();
-
-        let body = if splitted_temp.len() > 1 {
-            splitted_temp[1].to_string()
-        } else {
-            "".to_string()
-        };
 
         let mut args = HashMap::new();
 
@@ -214,24 +233,67 @@ impl Server {
 
         let response: (String, u16);
 
-        if code != 200 {
-            response = self.error_with_code(code, parsed_request.clone());
+        let query_string = req
+            .path
+            .unwrap_or_default()
+            .split("?")
+            .collect::<Vec<&str>>();
+
+        let query_string = query_string.get(1).unwrap_or(&"");
+
+        // redirect raw path + query string
+        let redirect_path = self.redirects.get(path);
+
+        if let Some(redirect) = redirect_path {
+            self.say(
+                format!("[INFO]    Redirecting client from {} to {}", path, redirect).as_str(),
+            );
+
+            response = ("MOVED PERMENANTLY".to_string(), 301);
         } else {
-            if let Some(callback) = self.route_callbacks.get(path) {
-                // call the callback
-                response = match callback.clone().try_lock() {
-                    Ok(prepared_callback) => prepared_callback(parsed_request.clone()),
-                    Err(_) => {
-                        self.say(
-                            "[ERROR]   Failed to acquire lock on callback (probably because it has panicked), attempting to error out with 500.",
-                        );
-                        self.error_with_code(500, parsed_request.clone())
-                    }
-                };
+            if code != 200 {
+                response = self.error_with_code(code, parsed_request.clone());
             } else {
-                self.say("[ERROR]   No route found, attempting to error out with 404.");
-    
-                response = self.error_with_code(404, parsed_request.clone());
+                // paths can come in multiple formats, so we need to check for all of them
+                // they are all taken to /path eventually
+                // allowed types:
+                // /path
+                // /path/
+                // /path?query=string
+                // /path/?query=string
+                // site.com/path
+
+                let path = req.path.unwrap().trim_end_matches('/');
+
+                // Remove leading slash if present
+                let path = if path.starts_with('/') {
+                    &path[1..]
+                } else {
+                    path
+                };
+
+                // Remove query string if present
+                let path = path.split('?').next().unwrap();
+
+                // Add leading slash
+                let path = format!("/{}", path);
+
+                if let Some(callback) = self.route_callbacks.get(&path) {
+                    // call the callback
+                    response = match callback.clone().try_lock() {
+                        Ok(prepared_callback) => prepared_callback(parsed_request.clone()),
+                        Err(_) => {
+                            self.say(
+                                "[ERROR]   Failed to acquire lock on callback (probably because it has panicked), attempting to error out with 500.",
+                            );
+                            self.error_with_code(500, parsed_request.clone())
+                        }
+                    };
+                } else {
+                    self.say("[ERROR]   No route found, attempting to error out with 404.");
+
+                    response = self.error_with_code(404, parsed_request.clone());
+                }
             }
         }
 
@@ -244,7 +306,7 @@ impl Server {
                     '3' => "[INFO]   ",
                     '4' => "[ERROR]  ",
                     '5' => "[ERROR]  ",
-                    _ =>   "[INFO]   ",
+                    _ => "[INFO]   ",
                 },
                 response.1,
                 STATUS_CODES.lookup(response.1).unwrap(),
@@ -254,10 +316,23 @@ impl Server {
         );
 
         let response = format!(
-            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\nContent-Length: {}{}\r\n\r\n{}",
             response.1,
             STATUS_CODES.lookup(response.1).unwrap(),
             response.0.len(),
+            if redirect_path.is_some() {
+                format!(
+                    "\r\nLocation: {}{}",
+                    redirect_path.unwrap(),
+                    if query_string.is_empty() {
+                        "".to_string()
+                    } else {
+                        format!("?{}", query_string)
+                    }
+                )
+            } else {
+                "".to_string()
+            },
             response.0
         );
 
@@ -278,18 +353,7 @@ impl Server {
 
     pub fn redirect(&mut self, paths: Vec<String>, to: String) {
         for path in paths {
-            let to_clone = to.clone();
-
-
-            self.route(&path, move |_| {
-                (
-                    format!(
-                        "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
-                        to_clone
-                    ),
-                    301,
-                )
-            });
+            self.redirects.insert(path, to.clone());
         }
     }
 
@@ -340,14 +404,9 @@ mod tests {
     fn test_server() {
         let mut server = Server::new(8080, "localhost".to_string());
 
-        server.route("/", |req| {
-            (
-                format!(
-                    "Hello, {}!",
-                    req.args.get("name").unwrap_or(&"world".to_string())
-                ),
-                200,
-            )
+        server.route("/", |req| match req.form {
+            Some(form) => (format!("Hello, {}!", form.get("name").unwrap()), 200),
+            None => ("Hello, World!".to_string(), 200),
         });
 
         server.route("/echo", |req| (format!("{:?}", req), 200));
