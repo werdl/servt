@@ -10,7 +10,7 @@ use smol;
 use httparse;
 use status_code::STATUS_CODES;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
@@ -73,7 +73,60 @@ impl Server {
         (msg, code)
     }
 
+    fn search_for_headers(&self, headers: &[httparse::Header], key: &str) -> Option<String> {
+        for header in headers {
+            if header.name.to_lowercase() == key.to_lowercase() {
+                return Some(String::from_utf8_lossy(header.value).to_string());
+            }
+        }
+
+        None
+    }
+
+    fn error_with_code(&self, code: u16, request: ParsedRequest) -> (String, u16) {
+        self.find_error_or(request, (STATUS_CODES.lookup(code).unwrap().to_string(), code))
+    }
+
+    fn get_body(&self, stream: &mut TcpStream) -> String {
+        let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
+
+        let mut request_text = String::new();
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut req = httparse::Request::new(&mut headers);
+
+        loop {
+            let mut line = String::new();
+            buf_reader.read_line(&mut line).unwrap();
+            request_text.push_str(&line);
+
+            if line == "\r\n" {
+                break;
+            }
+        }
+
+        req.parse(request_text.as_bytes()).unwrap();
+
+        println!("{:?}", req.headers);
+
+        if self.search_for_headers(&req.headers, "Expect").unwrap_or_default() == "100-continue" {
+            self.say("[INFO]    Responding with 100 CONTINUE");
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+
+            request_text.clear();
+
+            println!("Reading to string");
+            buf_reader.read_to_string(&mut request_text).unwrap();
+
+            println!("done{:?}", request_text);
+        }
+
+        (request_text)
+    }
+
+
     fn handle(&mut self, mut stream: TcpStream) {
+        let mut code = 200;
+
         self.say(
             format!(
                 "[INFO]    New connection from {}",
@@ -82,19 +135,28 @@ impl Server {
             .as_str(),
         );
 
-        let buf_reader = BufReader::new(&mut stream);
-        let request_text = buf_reader
-            .lines()
-            .map(|result| result.unwrap())
-            .take_while(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .as_slice()
-            .join("\r\n");
+        let request_text = self.get_body(&mut stream);
 
-        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
         req.parse(request_text.as_bytes()).unwrap();
 
+        let required_headers = ["Host"];
+
+        for header in required_headers.iter() {
+            if self.search_for_headers(&req.headers, header).is_none() {
+                self.say(
+                    format!(
+                        "[ERROR]   Missing required header: {}",
+                        header.to_uppercase()
+                    )
+                    .as_str(),
+                );
+                code = 400;
+            }
+        }
+
+            
         let splitted_temp = request_text.split("\r\n\r\n").collect::<Vec<&str>>();
 
         let body = if splitted_temp.len() > 1 {
@@ -118,7 +180,7 @@ impl Server {
             }
         }
 
-        let form = if req.method.unwrap() == "POST" {
+        let form = if req.method.unwrap_or_default() == "POST" {
             let mut form = HashMap::new();
             for pair in body.split("&") {
                 let mut key_value = pair.split("=");
@@ -152,34 +214,41 @@ impl Server {
 
         let response: (String, u16);
 
-        if let Some(callback) = self.route_callbacks.get(path) {
-            // call the callback
-            response = match callback.clone().try_lock() {
-                Ok(prepared_callback) => prepared_callback(parsed_request.clone()),
-                Err(_) => {
-                    self.say(
-                        "[ERROR]   Failed to acquire lock on callback (probably because it has panicked), attempting to error out with 500.",
-                    );
-                    ("INTERNAL SERVER ERROR".to_string(), 500)
-                }
-            };
+        if code != 200 {
+            response = self.error_with_code(code, parsed_request.clone());
         } else {
-            self.say("[ERROR]   No route found, attempting to error out with 404.");
-
-            response = self.find_error_or(parsed_request.clone(), ("NOT FOUND".to_string(), 404));
+            if let Some(callback) = self.route_callbacks.get(path) {
+                // call the callback
+                response = match callback.clone().try_lock() {
+                    Ok(prepared_callback) => prepared_callback(parsed_request.clone()),
+                    Err(_) => {
+                        self.say(
+                            "[ERROR]   Failed to acquire lock on callback (probably because it has panicked), attempting to error out with 500.",
+                        );
+                        self.error_with_code(500, parsed_request.clone())
+                    }
+                };
+            } else {
+                self.say("[ERROR]   No route found, attempting to error out with 404.");
+    
+                response = self.error_with_code(404, parsed_request.clone());
+            }
         }
 
         self.say(
             format!(
-                "{} Responded with status code {} {} to {}",
-                if response.1.to_string().chars().nth(0).unwrap() == '2' {
-                    "[SUCCESS]"
-                } else {
-                    "[WARNING]"
+                "{} Responded with status code {} {} to client on route {}",
+                match response.1.to_string().chars().nth(0).unwrap() {
+                    '1' => "[INFO]   ",
+                    '2' => "[SUCCESS]",
+                    '3' => "[INFO]   ",
+                    '4' => "[ERROR]  ",
+                    '5' => "[ERROR]  ",
+                    _ =>   "[INFO]   ",
                 },
                 response.1,
                 STATUS_CODES.lookup(response.1).unwrap(),
-                stream.peer_addr().unwrap()
+                req.path.unwrap()
             )
             .as_str(),
         );
@@ -197,8 +266,6 @@ impl Server {
         stream.flush().unwrap();
 
         stream.shutdown(Shutdown::Both).unwrap();
-
-        return;
     }
 
     pub fn route<F>(&mut self, path: &str, callback: F)
@@ -207,6 +274,23 @@ impl Server {
     {
         self.route_callbacks
             .insert(path.to_string(), Arc::new(Mutex::new(callback)));
+    }
+
+    pub fn redirect(&mut self, paths: Vec<String>, to: String) {
+        for path in paths {
+            let to_clone = to.clone();
+
+
+            self.route(&path, move |_| {
+                (
+                    format!(
+                        "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
+                        to_clone
+                    ),
+                    301,
+                )
+            });
+        }
     }
 
     pub fn error<F>(&mut self, code: u16, callback: F)
@@ -265,6 +349,10 @@ mod tests {
                 200,
             )
         });
+
+        server.route("/echo", |req| (format!("{:?}", req), 200));
+
+        server.redirect(vec!["/hello".to_string()], "/".to_string());
 
         server.error(404, |_| ("Custom 404 page".to_string(), 404));
 
