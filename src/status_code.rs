@@ -1,4 +1,4 @@
-pub(crate) static STATUS_CODES: &[(&'static str, u16)] = &[
+pub(crate) static STATUS_CODES: &[(&str, u16)] = &[
     ("CONTINUE", 100),
     ("SWITCHING PROTOCOLS", 101),
     ("PROCESSING", 102),
@@ -74,10 +74,12 @@ pub(crate) trait CodeLookup {
 
 impl CodeLookup for &[(&'static str, u16)] {
     fn lookup(&self, code: u16) -> Option<&'static str> {
-        self.iter().find_map(|(name, c)| if *c == code { Some(*name) } else { None })
+        self.iter()
+            .find_map(|(name, c)| if *c == code { Some(*name) } else { None })
     }
 
     fn lookup_code(&self, code: &'static str) -> Option<u16> {
-        self.iter().find_map(|(name, c)| if *name == code { Some(*c) } else { None })
+        self.iter()
+            .find_map(|(name, c)| if *name == code { Some(*c) } else { None })
     }
 }
